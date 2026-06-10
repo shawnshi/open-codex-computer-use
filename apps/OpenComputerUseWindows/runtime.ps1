@@ -46,8 +46,14 @@ public static class OCUWin32 {
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern IntPtr SendMessage(IntPtr hWnd, UInt32 msg, IntPtr wParam, string lParam);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetProcessDPIAware();
 }
 "@
+
+# Fix coordinate scaling drift by forcing the PowerShell process to be DPI Aware
+try { [void][OCUWin32]::SetProcessDPIAware() } catch {}
 
 $WM_SETTEXT = 0x000C
 $WM_MOUSEMOVE = 0x0200
@@ -237,6 +243,11 @@ function Get-VirtualKey([string]$key) {
         "backspace" = 0x08; "back_space" = 0x08; "delete" = 0x2E; "space" = 0x20
         "left" = 0x25; "up" = 0x26; "right" = 0x27; "down" = 0x28
         "home" = 0x24; "end" = 0x23; "page_up" = 0x21; "prior" = 0x21; "page_down" = 0x22; "next" = 0x22
+        # Extended multimedia/system keys
+        "volume_mute" = 0xAD; "volume_down" = 0xAE; "volume_up" = 0xAF
+        "media_next" = 0xB0; "media_prev" = 0xB1; "media_stop" = 0xB2; "media_play_pause" = 0xB3
+        "print" = 0x2A; "print_screen" = 0x2C; "insert" = 0x2D; "menu" = 0x5D; "apps" = 0x5D
+        "-" = 0xBD; "=" = 0xBB; "[" = 0xDB; "]" = 0xDD; "\" = 0xDC; ";" = 0xBA; "'" = 0xDE; "," = 0xBC; "." = 0xBE; "/" = 0xBF; "`" = 0xC0
     }
     if ($map.ContainsKey($normalized)) {
         return $map[$normalized]
@@ -480,6 +491,17 @@ function Render-Tree($element, $windowBounds) {
         $index = $script:nextIndex
         $script:nextIndex++
         $record = Get-ElementRecord $node $index $script:windowBounds
+        
+        # [Antigravity Pruning]: Skip off-screen or zero-bound elements to prevent Token Bloat
+        $isOffscreen = $false
+        try { $isOffscreen = $node.Current.IsOffscreen } catch {}
+        if ($isOffscreen -and $depth -gt 2) {
+            return
+        }
+        if ($null -eq $record.frame -and $depth -gt 2) {
+            return
+        }
+
         $script:records.Add($record)
 
         $role = $record.localizedControlType
@@ -599,12 +621,24 @@ function Build-Snapshot([string]$query) {
 
 function List-Apps {
     $lines = New-Object System.Collections.Generic.List[string]
-    foreach ($process in (Get-Process | Where-Object { $_.MainWindowHandle -ne 0 } | Sort-Object ProcessName, Id)) {
+    $currentSessionId = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+    $desktopSession = 1 # Assuming 1 is interactive desktop for now, heuristic fallback
+    
+    # Check if we are running in a Headless/Service Session (Session 0)
+    if ($currentSessionId -eq 0) {
+        $lines.Add("[WARNING] Antigravity CLI is running in Session 0 (Service/Headless mode). Windows UI Automation cannot see Desktop Apps here. Please run via interactive terminal.")
+    }
+
+    foreach ($process in (Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.SessionId -ne 0 } | Sort-Object ProcessName, Id)) {
         $title = $process.MainWindowTitle
         if ([string]::IsNullOrWhiteSpace($title)) {
             $title = "untitled"
         }
-        $lines.Add(("{0} -- {1} [running, pid={2}, window={3}]" -f $process.ProcessName, $process.ProcessName, $process.Id, $title))
+        $lines.Add(("{0} -- {1} [running, pid={2}, window={3}, session={4}]" -f $process.ProcessName, $process.ProcessName, $process.Id, $title, $process.SessionId))
+    }
+    
+    if ($lines.Count -eq 0) {
+        $lines.Add("No running top-level apps are visible to this Windows runtime in Session $currentSessionId.")
     }
     return ($lines -join "`n")
 }

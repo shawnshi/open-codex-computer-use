@@ -77,7 +77,7 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "list_apps",
-            description: "List the apps on this computer. Returns the set of apps that are currently running, as well as any that have been used in the last 14 days, including details on usage frequency. This tool is part of plugin `Computer Use`.",
+            description: "List the apps on this computer. Returns the set of apps that are currently running. (Note: on macOS, this may also include recently used apps). This tool is part of plugin `Computer Use`.",
             annotations: readOnlyAnnotations(),
             inputSchema: objectSchema(properties: [:], required: [])
         ),

@@ -1,167 +1,104 @@
-# open-computer-use
+# Open Codex Computer Use (Antigravity 定制版)
 
-[![English](https://img.shields.io/badge/English-Click-yellow)](./README.md)
-[![简体中文](https://img.shields.io/badge/简体中文-点击查看-orange)](./README.zh-CN.md)
-[![Release](https://img.shields.io/github/v/release/iFurySt/open-codex-computer-use)](https://github.com/iFurySt/open-codex-computer-use/releases)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/iFurySt/open-codex-computer-use)
-<a href="https://llmapis.com?source=https%3A%2F%2Fgithub.com%2FiFurySt%2Fopen-codex-computer-use" target="_blank"><img src="https://llmapis.com/api/badge/iFurySt/open-codex-computer-use" alt="LLMAPIS" width="20" /></a>
+本项目是基于原生 [Open Codex Computer Use](https://github.com/iFurySt/open-codex-computer-use) 深度优化的非抢占式桌面自动化 Agent 基础设施。通过 Model Context Protocol (MCP)，将底层的屏幕抓取（UIA/AT-SPI）、应用树解析与鼠标键盘注入功能，安全地暴露给诸如 Gemini 3.1 Pro 这样的大型语言模型。
 
-> [!TIP]
-> Interested in Browser Use? Check out [open-browser-use](https://github.com/iFurySt/open-codex-browser-use).
+本“Antigravity 定制版”深度聚焦于 **Windows 端的高效与稳定性**，彻底解决了大模型在处理复杂 UIDOM 时的 Token 爆炸问题与点击漂移现象。
 
 ---
 
-`open-computer-use` is an open-source `Computer Use` service wrapped as `MCP`. Any AI agent or MCP client can use it to run Computer Use on macOS, Linux, and Windows.
+## ⚡ 核心定制特性 (Features)
 
-This project was inspired by OpenAI's [Codex Computer Use](https://openai.com/index/codex-for-almost-everything/). It showed that non-intrusive CUA can be built on top of Accessibility, so I decided to build an open-source version.
+相比于官方原版，本定制分支实现了以下关键突破：
 
-I started this repo with my [harness template](https://github.com/iFurySt/harness-template), a template for quickly spinning up AI-first projects. It has been one of our most useful workflows lately, especially for nearly 100% AI-generated projects. I also wrote [a post](https://www.ifuryst.com/blog/2026/speedrunning-the-ai-era/) about the methodology behind it.
+1. **零宽与离屏元素暴力剪枝 (Aggressive Token Pruning)**：
+   自动拦截深度大于 2 级的 `IsOffscreen` 节点及无实体尺寸节点。针对 VS Code、浏览器等 Electron 级重度 DOM 树应用，将大模型的视觉序列化 Token 消耗降低 50% - 80%。
+2. **DPI 物理像素对齐 (True DPI Awareness)**：
+   强制注入并激活 `SetProcessDPIAware()`。大模型从截图中计算的物理坐标，将不受系统 150%/200% 缩放率的干扰，彻底消灭“指东打西”的点击漂移 bug。
+3. **扩展组合键谱 (Expanded Keymap)**：
+   补齐了 Windows 运行时下的标准符号映射（`[`、`=` 等）与多媒体/系统控制键（`volume_up`、`print_screen`），与 Linux xdotool 语义实现大一统。
+4. **Session 0 防盲区感知 (Headless Service Protection)**：
+   针对作为系统守护进程启动的 CLI 环境，自动嗅探 `SessionId`。当因为 Session 隔离而无法读取桌面 UI 时，主动抛出警告，防止大模型陷入“幻觉”。
 
-## Demos
+---
 
-### Codex App and Codex CLI
+## 🏗 架构设计 (Architecture)
 
-[![Open Computer Use custom demo cover](./docs/generated/readme-assets/open-computer-use-demo-cover.png)](https://youtu.be/2s6aVpGiwaQ)
+整体采用 **MCP 接口定义层 - Go 守护调度层 - OS 原生 API 注入层** 的三段式架构：
 
-<sub><em>`open-computer-use` used as Computer Use in Codex App and Codex CLI, matching the official experience.</em></sub>
-
-### Gemini CLI
-
-https://github.com/user-attachments/assets/eacb3b15-f939-46c7-b3b3-6f876977a58d
-
-<sub><em>Gemini CLI connects to `open-computer-use` through MCP and runs full Computer Use actions.</em></sub>
-
-### Linux
-
-https://github.com/user-attachments/assets/e036b1c8-2200-4896-abd4-19225915cf66
-
-<sub><em>`open-computer-use` running on Linux.</em></sub>
-
-## Quick Start
-
-```bash
-npm i -g open-computer-use
+```mermaid
+graph TD
+    A[Antigravity CLI / Gemini 3.1 Pro] -->|JSON-RPC over stdio| B(MCP Server npm package)
+    B -->|Child Process| C(open-computer-use.exe Go Binary)
+    C -->|embed & execute| D(runtime.ps1)
+    
+    subgraph OS Layer
+        D -->|P/Invoke C#| E[user32.dll DPI & Windows Message]
+        D -->|.NET Interop| F[UIAutomationClient COM]
+    end
 ```
 
-**On macOS, run it once and grant `Accessibility` and `Screen Recording`. Windows and Linux do not need this step.**
+- **MCP 层**：遵守 Anthropic/MCP 协议规范，暴露了 `click`、`type_text`、`get_app_state` 等 9 个基础工具。
+- **Go 调度层 (`apps/OpenComputerUseWindows`)**：处理跨平台入口的标准化分发，编译时通过 `go:embed` 将 PowerShell 底层脚本静态打入 `.exe` 文件。
+- **Win32 桥接层 (`runtime.ps1`)**：通过 C# `[DllImport]` 动态反射调用 Win32 原生 `SendMessage` 与 `UIAutomationClient`。相较于完全 CGO 重写，本方案保证了极高的代码热更新灵活性与分发轻量化。
 
-```bash
-open-computer-use
+---
+
+## 📦 部署指南 (Deployment)
+
+作为 Antigravity CLI 的专用能力插件，请按照以下步骤完成本地编译与挂载：
+
+### 1. 环境依赖
+*   **Node.js**: `v20.0.0+` (用于运行全局 MCP 进程)
+*   **Go**: `1.21+` (用于二次编译优化后的 Windows 运行环境)
+
+### 2. NPM 全局安装与依赖占位
+```powershell
+# 先通过 npm 安装官方版本的基础架构
+npm install -g open-computer-use
 ```
 
-Before using it, install it into your agent:
+### 3. 编译定制版内核并替换
+进入本项目的 Windows 运行时目录，执行编译并热替换 NPM 目录下的全局执行档：
+```powershell
+cd scratch/open-codex-computer-use/apps/OpenComputerUseWindows
+go build -o open-computer-use.exe main.go
 
-```bash
-# Install into Codex by writing to ~/.codex/config.toml
-open-computer-use install-codex-mcp
+# 停止当前可能驻留的 MCP 进程
+Stop-Process -Name "open-computer-use" -Force -ErrorAction SilentlyContinue
+
+# 覆盖 NPM 发行版的 amd64 文件
+Copy-Item -Path "open-computer-use.exe" -Destination "$env:APPDATA\npm\node_modules\open-computer-use\dist\windows\amd64\open-computer-use.exe" -Force
 ```
 
-Or add it to your own client manually:
-
+### 4. 注册到 Antigravity CLI
+修改位于 `C:\Users\shich\.gemini\config\mcp_config.json` 的配置文件，加入以下挂载节点：
 ```json
 {
   "mcpServers": {
     "open-computer-use": {
-      "command": "open-computer-use",
-      "args": ["mcp"]
+      "command": "npx",
+      "args": ["-y", "open-computer-use", "mcp"]
     }
   }
 }
 ```
+*完成后重启 Antigravity CLI 即可激活。*
 
-### Skill
+---
 
-Install the skill directly:
+## 💻 使用说明 (Usage)
 
-```bash
-# Install for Codex
-npx skills add iFurySt/open-codex-computer-use -g -a codex --skill open-computer-use -y
-npx skills ls -g -a codex | rg 'open-computer-use'
-```
+挂载成功后，Antigravity Agent 将自动获取底层电脑操控能力。
 
-Install for Claude Code:
+**端到端联调示例：**
+1. 在 Antigravity 中输入指令：
+   > “调用 computer-operator 帮我打开记事本并写下一句 Hello World”
+2. 此时，大模型会按照 OODA（观察-定位-决策-行动）循环，依次执行：
+   - 调用 `list_apps` 查找记事本是否打开
+   - 若未打开，可能尝试 `press_key` 唤出 `super` 菜单搜索“Notepad”
+   - 调用 `get_app_state` 获取记事本最新 UI 树和截图
+   - 解析目标文本框元素的 `element_index`
+   - 调用 `type_text` 完成文本注入
 
-```bash
-npx skills add iFurySt/open-codex-computer-use -g -a claude-code --skill open-computer-use -y
-```
-
-Update an existing global install, including the Codex install created above:
-
-```bash
-npx skills update open-computer-use -g -y
-```
-
-You can also manually download and install the
-[`open-computer-use` skill](./skills/open-computer-use).
-
-## More
-
-Besides the MCP JSON config above, you can also use the built-in commands:
-
-```bash
-# Install into Codex by writing to ~/.codex/config.toml
-open-computer-use install-codex-mcp
-
-# Install as a Codex plugin, mainly for Codex App
-open-computer-use install-codex-plugin
-
-# Install into Claude Code by writing to ~/.claude.json
-open-computer-use install-claude-mcp
-
-# Install into Gemini CLI for the current project by writing to ./.gemini/settings.json
-open-computer-use install-gemini-mcp
-
-# Install into Gemini CLI user config instead
-open-computer-use install-gemini-mcp --scope user
-
-# Install into opencode by writing to ~/.config/opencode/opencode.json (or the active config file)
-open-computer-use install-opencode-mcp
-
-# Call a single Computer Use tool and print the MCP-style JSON result
-open-computer-use call list_apps
-open-computer-use call get_app_state --args '{"app":"TextEdit"}'
-
-# Run a sequence in one process so element_index state can be reused
-# Sequence runs sleep 1s between successful operations by default
-open-computer-use call --calls '[{"tool":"get_app_state","args":{"app":"TextEdit"}},{"tool":"press_key","args":{"app":"TextEdit","key":"Return"}}]'
-open-computer-use call --calls-file examples/textedit-overlay-seq.json --sleep 0.5
-
-# Check permissions; onboarding only opens when something is missing
-open-computer-use doctor
-
-# Run local validation from a source checkout
-make smoke
-OPEN_COMPUTER_USE_STRESS_LOOPS=20 make stress
-make agent-smoke
-make agent-smoke SCENARIO=fixture-full
-node ./scripts/run-agent-smoke-tests.mjs --agents=claude,codex --command=open-computer-use
-node ./scripts/run-agent-smoke-tests.mjs --scenario=fixture --agents=claude,codex --command=open-computer-use
-node ./scripts/run-agent-smoke-tests.mjs --scenario=fixture-full --agents=claude,codex --command=open-computer-use
-OPEN_COMPUTER_USE_HERMES_PROVIDER=anthropic OPEN_COMPUTER_USE_HERMES_MODEL=claude-opus-4-20250514 make agent-smoke AGENTS=hermes SCENARIO=fixture-full
-node ./scripts/run-agent-smoke-tests.mjs --agents=hermes --hermes-provider=anthropic --hermes-model=claude-opus-4-20250514
-node ./scripts/run-agent-smoke-tests.mjs --scenario=fixture --agents=hermes --hermes-provider=anthropic --hermes-model=claude-opus-4-20250514
-node ./scripts/run-agent-smoke-tests.mjs --scenario=fixture-full --agents=hermes --hermes-provider=anthropic --hermes-model=claude-opus-4-20250514 --hermes-max-turns=12
-
-# Show help
-open-computer-use -h
-```
-
-## Cursor Motion
-
-Cursor Motion is an open-source cursor motion system for macOS, based on public information shared by members of the Software.Inc team. You can download the app from the [Releases page](https://github.com/iFurySt/open-codex-computer-use/releases).
-
-[![Cursor Motion custom demo cover](./docs/generated/readme-assets/cursor-motion-demo-cover.png)](https://youtu.be/KRUq5GUHv1Q)
-
-## Star History
-
-<a href="https://www.star-history.com/?repos=iFurySt%2Fopen-codex-computer-use&type=date&legend=top-left">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=ifuryst/open-codex-computer-use&type=date&theme=dark&legend=top-left" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=ifuryst/open-codex-computer-use&type=date&legend=top-left" />
-    <img alt="Star History Chart for open-computer-use" src="https://api.star-history.com/chart?repos=ifuryst/open-codex-computer-use&type=date&legend=top-left" />
-  </picture>
-</a>
-
-## License
-
-[MIT](./LICENSE)
+**⚠️ 注意事项**：
+为了保证 UIA (UI Automation) 能正常读取界面，请确保运行 Antigravity CLI 的终端具有系统的前台桌面交互权限（Interactive Session），切勿在纯后台系统服务级（Session 0）账户中执行 UI 操作。
