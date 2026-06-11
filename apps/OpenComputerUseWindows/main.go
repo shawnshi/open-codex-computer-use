@@ -167,6 +167,13 @@ func newService() *service {
 
 func (s *service) callTool(name string, args map[string]any) toolCallResult {
 	switch name {
+	case "wait_for_condition":
+		return s.waitForCondition(
+			requiredString(args, "app"),
+			requiredString(args, "condition_type"),
+			requiredString(args, "condition_text"),
+			intValue(optionalFloat(args, "timeout_sec"), 15),
+		)
 	case "list_apps":
 		return s.listApps()
 	case "get_app_state":
@@ -177,6 +184,13 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 			optionalElementIndex(args),
 			optionalFloat(args, "x"),
 			optionalFloat(args, "y"),
+			intValue(optionalFloat(args, "click_count"), 1),
+			defaultString(optionalString(args, "mouse_button"), "left"),
+		)
+	case "click_by_ocr":
+		return s.clickByOcr(
+			requiredString(args, "app"),
+			requiredString(args, "text"),
 			intValue(optionalFloat(args, "click_count"), 1),
 			defaultString(optionalString(args, "mouse_button"), "left"),
 		)
@@ -311,6 +325,42 @@ func (s *service) scroll(app, direction, elementIndex string, pages float64) too
 		return textResult(err.Error(), true)
 	}
 	return s.actionResult(app, psRequest{Tool: "scroll", App: app, Element: record, Direction: normalized, Pages: pages})
+}
+
+func (s *service) waitForCondition(app, conditionType, conditionText string, timeoutSec int) toolCallResult {
+	if app == "" {
+		return textResult("Missing required argument: app", true)
+	}
+	request := psRequest{
+		Tool:   "wait_for_condition",
+		App:    app,
+		Action: conditionType,
+		Text:   conditionText,
+		Pages:  float64(timeoutSec), // using Pages as timeout numeric carrier
+	}
+	return s.actionResult(app, request)
+}
+
+func (s *service) clickByOcr(app, text string, clickCount int, mouseButton string) toolCallResult {
+	if app == "" {
+		return textResult("Missing required argument: app", true)
+	}
+	if text == "" {
+		return textResult("Missing required argument: text", true)
+	}
+	snapshot := s.currentSnapshot(app)
+	if snapshot == nil {
+		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
+	}
+	request := psRequest{
+		Tool:         "click_by_ocr",
+		App:          app,
+		Text:         text,
+		ClickCount:   clickCount,
+		MouseButton:  mouseButton,
+		WindowBounds: snapshot.WindowBounds,
+	}
+	return s.actionResult(app, request)
 }
 
 func (s *service) drag(app string, fromX, fromY, toX, toY *float64) toolCallResult {
@@ -567,6 +617,28 @@ func defaultString(value, fallback string) string {
 
 func toolDefinitions() []toolDefinition {
 	return []toolDefinition{
+		{
+			Name:        "wait_for_condition",
+			Description: "Wait for a specific condition to be met before continuing. Useful to avoid polling or manual sleeps. The tool blocks until the condition is met or the timeout is reached. This tool is part of plugin `Computer Use`.",
+			Annotations: defaultAnnotations(),
+			InputSchema: objectSchema(map[string]any{
+				"app":            stringProperty("App name or bundle identifier"),
+				"condition_type": enumStringProperty("Type of condition to wait for", []string{"window_opened", "element_appears"}),
+				"condition_text": stringProperty("Regex pattern to match Window Name or Element Name"),
+				"timeout_sec":    integerProperty("Timeout in seconds. Maximum 60. Defaults to 15."),
+			}, []string{"app", "condition_type", "condition_text"}),
+		},
+		{
+			Name:        "click_by_ocr",
+			Description: "Click on text found on the screen using OCR. Useful for Canvas, Games, or legacy UI where UIA tree fails. This tool is part of plugin `Computer Use`.",
+			Annotations: defaultAnnotations(),
+			InputSchema: objectSchema(map[string]any{
+				"app":           stringProperty("App name or bundle identifier"),
+				"text":          stringProperty("The exact or partial text to search for on the screen"),
+				"click_count":   integerProperty("Number of clicks. Defaults to 1"),
+				"mouse_button":  enumStringProperty("Mouse button to click. Defaults to left.", []string{"left", "right", "middle"}),
+			}, []string{"app", "text"}),
+		},
 		{
 			Name:        "click",
 			Description: "Click an element by index or pixel coordinates from screenshot. This tool is part of plugin `Computer Use`.",

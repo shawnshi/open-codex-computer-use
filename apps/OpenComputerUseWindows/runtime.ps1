@@ -970,6 +970,196 @@ function Invoke-TypeText($process, [string]$text) {
     return $false
 }
 
+function Invoke-Ocr([string]$imagePath) {
+    $exePath = "$env:TEMP\open_computer_use_ocrengine.exe"
+    if (-not (Test-Path $exePath)) {
+        $csCode = @"
+using System;
+using System.IO;
+using Windows.Graphics.Imaging;
+using Windows.Media.Ocr;
+using Windows.Storage;
+
+namespace NativeOCR {
+    class Program {
+        static void Main(string[] args) {
+            if (args.Length < 1) return;
+            try { Console.WriteLine(Recognize(args[0])); } catch { }
+        }
+        static T Await<T>(Windows.Foundation.IAsyncOperation<T> op) {
+            while (op.Status == Windows.Foundation.AsyncStatus.Started) { System.Threading.Thread.Sleep(5); }
+            if (op.Status != Windows.Foundation.AsyncStatus.Completed) throw new Exception();
+            return op.GetResults();
+        }
+        static string Recognize(string imagePath) {
+            var file = Await(StorageFile.GetFileFromPathAsync(imagePath));
+            var stream = Await(file.OpenAsync(FileAccessMode.Read));
+            var decoder = Await(BitmapDecoder.CreateAsync(stream));
+            var softwareBitmap = Await(decoder.GetSoftwareBitmapAsync());
+            var engine = OcrEngine.TryCreateFromUserProfileLanguages();
+            if (engine == null) return `"[]`";
+            var result = Await(engine.RecognizeAsync(softwareBitmap));
+            var list = new System.Collections.Generic.List<string>();
+            foreach (var line in result.Lines) {
+                foreach (var word in line.Words) {
+                    string safeText = word.Text.Replace(`"`"\"", `"\\\""`);
+                    list.Add(string.Format(`"{{\\"text\\":\\"{0}\\", \\"x\\":{1}, \\"y\\":{2}, \\"width\\":{3}, \\"height\\":{4}}}`",
+                        safeText, word.BoundingRect.X, word.BoundingRect.Y, word.BoundingRect.Width, word.BoundingRect.Height));
+                }
+            }
+            return `"[`" + string.Join(`",`", list) + `"]`";
+        }
+    }
+}
+"@
+        $csPath = "$env:TEMP\open_computer_use_ocrengine.cs"
+        Set-Content -Path $csPath -Value $csCode -Encoding UTF8
+        $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+        $winmdDir = "C:\Windows\System32\WinMetadata"
+        $refs = @("System.Runtime.dll", "System.Runtime.WindowsRuntime.dll", "$winmdDir\Windows.Foundation.winmd", "$winmdDir\Windows.Graphics.winmd", "$winmdDir\Windows.Media.winmd", "$winmdDir\Windows.Storage.winmd")
+        $refArgs = $refs | ForEach-Object { "/reference:$_" }
+        $proc = Start-Process -FilePath $csc -ArgumentList "/nologo", "/target:exe", "/out:$exePath", $refArgs, $csPath -Wait -NoNewWindow -PassThru
+        if ($proc.ExitCode -ne 0) { return "[]" }
+    }
+
+    $json = & $exePath $imagePath
+    if ([string]::IsNullOrWhiteSpace($json)) { return @() }
+    return $json | ConvertFrom-Json
+}
+
+function Invoke-ClickByOcr([IntPtr]$hwnd, [string]$text, [string]$mouseButton, [int]$clickCount) {
+    if ($hwnd -ne [IntPtr]::Zero) {
+        [void][OCUWin32]::ShowWindow($hwnd, $SW_RESTORE)
+        [void][OCUWin32]::SetForegroundWindow($hwnd)
+        Start-Sleep -Milliseconds 200
+    }
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $bmp = New-Object System.Drawing.Bitmap([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width, [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height)
+    $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+    $gfx.CopyFromScreen(0, 0, 0, 0, $bmp.Size)
+    $path = "$env:TEMP\open_computer_use_screen.png"
+    $bmp.Save($path)
+    $gfx.Dispose()
+    $bmp.Dispose()
+    
+    $words = Invoke-Ocr $path
+    $match = $null
+    foreach ($w in $words) {
+        if ($w.text -match $text -or $w.text -eq $text) {
+            $match = $w
+            break
+        }
+    }
+    if ($null -ne $match) {
+        $x = [int]($match.x + $match.width / 2)
+        $y = [int]($match.y + $match.height / 2)
+        Send-MouseClick [IntPtr]::Zero $x $y $mouseButton $clickCount
+        return $true
+    }
+    throw "OCR Fallback failed: Could not find text '$text' on screen."
+}
+
+function Find-ElementByNameRegex($element, [string]$nameRegex) {
+    if ($null -eq $element) { return $false }
+    $name = Get-ElementString $element "Name"
+    if ($null -ne $name -and $name -match $nameRegex) { return $true }
+    
+    $walker = [Windows.Automation.TreeWalker]::ControlViewWalker
+    $child = $walker.GetFirstChild($element)
+    while ($null -ne $child) {
+        if (Find-ElementByNameRegex $child $nameRegex) { return $true }
+        $child = $walker.GetNextSibling($child)
+    }
+    return $false
+}
+
+function Invoke-WaitForCondition([string]$app, [string]$conditionType, [string]$conditionText, [int]$timeoutSec) {
+    if ($timeoutSec -le 0) { $timeoutSec = 15 }
+    $timeoutMs = $timeoutSec * 1000
+
+    if (-not ("OCUEventWaiter" -as [type])) {
+        $csCode = @"
+using System;
+using System.Threading;
+using System.Windows.Automation;
+using System.Text.RegularExpressions;
+
+public class OCUEventWaiter {
+    public static bool WaitForWindowOpened(string nameRegex, int timeoutMs) {
+        var mre = new ManualResetEventSlim(false);
+        AutomationEventHandler handler = (sender, e) => {
+            if (mre.IsSet) return;
+            try {
+                var el = sender as AutomationElement;
+                if (el != null) {
+                    if (string.IsNullOrEmpty(nameRegex)) { mre.Set(); return; }
+                    string name = el.Current.Name;
+                    if (name != null && Regex.IsMatch(name, nameRegex, RegexOptions.IgnoreCase)) {
+                        mre.Set();
+                    }
+                }
+            } catch {}
+        };
+        Automation.AddAutomationEventHandler(WindowPattern.WindowOpenedEvent, AutomationElement.RootElement, TreeScope.Subtree, handler);
+        bool result = mre.Wait(timeoutMs);
+        Automation.RemoveAutomationEventHandler(WindowPattern.WindowOpenedEvent, AutomationElement.RootElement, handler);
+        return result;
+    }
+
+    public static bool WaitForElementAppears(IntPtr hwnd, string nameRegex, int timeoutMs) {
+        if (hwnd == IntPtr.Zero) return false;
+        AutomationElement root;
+        try { root = AutomationElement.FromHandle(hwnd); } catch { return false; }
+        
+        var mre = new ManualResetEventSlim(false);
+        StructureChangedEventHandler handler = (sender, e) => {
+            if (mre.IsSet) return;
+            if (e.StructureChangeType == StructureChangeType.ChildAdded || e.StructureChangeType == StructureChangeType.ChildrenBulkAdded) {
+                try {
+                    var el = sender as AutomationElement;
+                    if (el != null) {
+                        if (string.IsNullOrEmpty(nameRegex)) { mre.Set(); return; }
+                        string name = el.Current.Name;
+                        if (name != null && Regex.IsMatch(name, nameRegex, RegexOptions.IgnoreCase)) {
+                            mre.Set();
+                        }
+                    }
+                } catch {}
+            }
+        };
+        Automation.AddStructureChangedEventHandler(root, TreeScope.Subtree, handler);
+        bool result = mre.Wait(timeoutMs);
+        Automation.RemoveStructureChangedEventHandler(root, handler);
+        return result;
+    }
+}
+"@
+        Add-Type -TypeDefinition $csCode -ReferencedAssemblies @("UIAutomationClient", "UIAutomationTypes", "System")
+    }
+
+    if ($conditionType -eq "window_opened") {
+        $existing = Get-Process | Where-Object { $_.MainWindowTitle -match $conditionText } | Select-Object -First 1
+        if ($null -ne $existing) { return $true }
+        return [OCUEventWaiter]::WaitForWindowOpened($conditionText, $timeoutMs)
+    } elseif ($conditionType -eq "element_appears") {
+        $process = Resolve-App $app
+        $hwnd = [IntPtr]$process.MainWindowHandle
+        if ($hwnd -eq [IntPtr]::Zero) { throw "App window is not open yet. Wait for window_opened first." }
+        
+        $root = Get-MainElement $process
+        if (Find-ElementByNameRegex $root $conditionText) { return $true }
+        
+        $result = [OCUEventWaiter]::WaitForElementAppears($hwnd, $conditionText, $timeoutMs)
+        if (-not $result) {
+            if (Find-ElementByNameRegex $root $conditionText) { return $true }
+        }
+        return $result
+    } else {
+        throw "Unsupported condition_type: $conditionType"
+    }
+}
+
 $operation = Get-Content -Raw -Path $OperationPath | ConvertFrom-Json
 
 try {
@@ -984,6 +1174,13 @@ try {
         $element = Find-Element $process $operation.element
 
         switch ($operation.tool) {
+            "wait_for_condition" {
+                $success = Invoke-WaitForCondition $operation.app $operation.action $operation.text ([int]$operation.pages)
+                if (-not $success) { throw "Timeout waiting for condition '$($operation.action)' with text '$($operation.text)'" }
+            }
+            "click_by_ocr" {
+                Invoke-ClickByOcr $hwnd $operation.text $operation.mouse_button ([int]$operation.click_count)
+            }
             "click" {
                 $handled = $false
                 if ($null -ne $element -and $operation.mouse_button -ne "right" -and $operation.mouse_button -ne "middle") {
