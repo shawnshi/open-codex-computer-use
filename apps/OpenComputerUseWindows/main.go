@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	_ "embed"
 	"encoding/json"
@@ -14,6 +15,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -159,27 +162,31 @@ type psResponse struct {
 
 type service struct {
 	snapshots map[string]*appSnapshot
+	psCmd     *exec.Cmd
+	psIn      io.Writer
+	psOut     *bufio.Reader
+	psMu      sync.Mutex
 }
 
 func newService() *service {
 	return &service{snapshots: map[string]*appSnapshot{}}
 }
 
-func (s *service) callTool(name string, args map[string]any) toolCallResult {
+func (s *service) callTool(ctx context.Context, name string, args map[string]any) toolCallResult {
 	switch name {
 	case "wait_for_condition":
-		return s.waitForCondition(
+		return s.waitForCondition(ctx,
 			requiredString(args, "app"),
 			requiredString(args, "condition_type"),
 			requiredString(args, "condition_text"),
 			intValue(optionalFloat(args, "timeout_sec"), 15),
 		)
 	case "list_apps":
-		return s.listApps()
+		return s.listApps(ctx)
 	case "get_app_state":
-		return s.getAppState(requiredString(args, "app"))
+		return s.getAppState(ctx, requiredString(args, "app"))
 	case "click":
-		return s.click(
+		return s.click(ctx,
 			requiredString(args, "app"),
 			optionalElementIndex(args),
 			optionalFloat(args, "x"),
@@ -188,27 +195,27 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 			defaultString(optionalString(args, "mouse_button"), "left"),
 		)
 	case "click_by_ocr":
-		return s.clickByOcr(
+		return s.clickByOcr(ctx,
 			requiredString(args, "app"),
 			requiredString(args, "text"),
 			intValue(optionalFloat(args, "click_count"), 1),
 			defaultString(optionalString(args, "mouse_button"), "left"),
 		)
 	case "perform_secondary_action":
-		return s.performSecondaryAction(
+		return s.performSecondaryAction(ctx,
 			requiredString(args, "app"),
 			requiredElementIndex(args),
 			requiredString(args, "action"),
 		)
 	case "scroll":
-		return s.scroll(
+		return s.scroll(ctx,
 			requiredString(args, "app"),
 			requiredString(args, "direction"),
 			requiredElementIndex(args),
 			floatValue(optionalFloat(args, "pages"), 1),
 		)
 	case "drag":
-		return s.drag(
+		return s.drag(ctx,
 			requiredString(args, "app"),
 			requiredFloat(args, "from_x"),
 			requiredFloat(args, "from_y"),
@@ -216,18 +223,18 @@ func (s *service) callTool(name string, args map[string]any) toolCallResult {
 			requiredFloat(args, "to_y"),
 		)
 	case "type_text":
-		return s.typeText(requiredString(args, "app"), requiredString(args, "text"))
+		return s.typeText(ctx, requiredString(args, "app"), requiredString(args, "text"))
 	case "press_key":
-		return s.pressKey(requiredString(args, "app"), requiredString(args, "key"))
+		return s.pressKey(ctx, requiredString(args, "app"), requiredString(args, "key"))
 	case "set_value":
-		return s.setValue(requiredString(args, "app"), requiredElementIndex(args), requiredString(args, "value"))
+		return s.setValue(ctx, requiredString(args, "app"), requiredElementIndex(args), requiredString(args, "value"))
 	default:
 		return textResult(fmt.Sprintf("unsupportedTool(%q)", name), true)
 	}
 }
 
-func (s *service) listApps() toolCallResult {
-	response, err := runPowerShell(psRequest{Tool: "list_apps"})
+func (s *service) listApps(ctx context.Context) toolCallResult {
+	response, err := s.runPowerShell(ctx, psRequest{Tool: "list_apps"})
 	if err != nil {
 		return textResult(err.Error(), true)
 	}
@@ -240,18 +247,18 @@ func (s *service) listApps() toolCallResult {
 	return textResult(response.Text, false)
 }
 
-func (s *service) getAppState(app string) toolCallResult {
+func (s *service) getAppState(ctx context.Context, app string) toolCallResult {
 	if app == "" {
 		return textResult("Missing required argument: app", true)
 	}
-	snapshot, result := s.refreshSnapshot(app, psRequest{Tool: "get_app_state", App: app})
+	snapshot, result := s.refreshSnapshot(ctx, app, psRequest{Tool: "get_app_state", App: app})
 	if result.IsError {
 		return result
 	}
 	return snapshot.result()
 }
 
-func (s *service) click(app, elementIndex string, x, y *float64, clickCount int, mouseButton string) toolCallResult {
+func (s *service) click(ctx context.Context, app, elementIndex string, x, y *float64, clickCount int, mouseButton string) toolCallResult {
 	if app == "" {
 		return textResult("Missing required argument: app", true)
 	}
@@ -278,10 +285,10 @@ func (s *service) click(app, elementIndex string, x, y *float64, clickCount int,
 		}
 		request.Element = record
 	}
-	return s.actionResult(app, request)
+	return s.actionResult(ctx, app, request)
 }
 
-func (s *service) performSecondaryAction(app, elementIndex, action string) toolCallResult {
+func (s *service) performSecondaryAction(ctx context.Context, app, elementIndex, action string) toolCallResult {
 	if app == "" {
 		return textResult("Missing required argument: app", true)
 	}
@@ -299,10 +306,10 @@ func (s *service) performSecondaryAction(app, elementIndex, action string) toolC
 	if err != nil {
 		return textResult(err.Error(), true)
 	}
-	return s.actionResult(app, psRequest{Tool: "perform_secondary_action", App: app, Element: record, Action: action})
+	return s.actionResult(ctx, app, psRequest{Tool: "perform_secondary_action", App: app, Element: record, Action: action})
 }
 
-func (s *service) scroll(app, direction, elementIndex string, pages float64) toolCallResult {
+func (s *service) scroll(ctx context.Context, app, direction, elementIndex string, pages float64) toolCallResult {
 	if app == "" {
 		return textResult("Missing required argument: app", true)
 	}
@@ -324,10 +331,10 @@ func (s *service) scroll(app, direction, elementIndex string, pages float64) too
 	if err != nil {
 		return textResult(err.Error(), true)
 	}
-	return s.actionResult(app, psRequest{Tool: "scroll", App: app, Element: record, Direction: normalized, Pages: pages})
+	return s.actionResult(ctx, app, psRequest{Tool: "scroll", App: app, Element: record, Direction: normalized, Pages: pages})
 }
 
-func (s *service) waitForCondition(app, conditionType, conditionText string, timeoutSec int) toolCallResult {
+func (s *service) waitForCondition(ctx context.Context, app, conditionType, conditionText string, timeoutSec int) toolCallResult {
 	if app == "" {
 		return textResult("Missing required argument: app", true)
 	}
@@ -338,10 +345,10 @@ func (s *service) waitForCondition(app, conditionType, conditionText string, tim
 		Text:   conditionText,
 		Pages:  float64(timeoutSec), // using Pages as timeout numeric carrier
 	}
-	return s.actionResult(app, request)
+	return s.actionResult(ctx, app, request)
 }
 
-func (s *service) clickByOcr(app, text string, clickCount int, mouseButton string) toolCallResult {
+func (s *service) clickByOcr(ctx context.Context, app, text string, clickCount int, mouseButton string) toolCallResult {
 	if app == "" {
 		return textResult("Missing required argument: app", true)
 	}
@@ -360,10 +367,10 @@ func (s *service) clickByOcr(app, text string, clickCount int, mouseButton strin
 		MouseButton:  mouseButton,
 		WindowBounds: snapshot.WindowBounds,
 	}
-	return s.actionResult(app, request)
+	return s.actionResult(ctx, app, request)
 }
 
-func (s *service) drag(app string, fromX, fromY, toX, toY *float64) toolCallResult {
+func (s *service) drag(ctx context.Context, app string, fromX, fromY, toX, toY *float64) toolCallResult {
 	if app == "" {
 		return textResult("Missing required argument: app", true)
 	}
@@ -383,10 +390,10 @@ func (s *service) drag(app string, fromX, fromY, toX, toY *float64) toolCallResu
 	if snapshot == nil {
 		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
 	}
-	return s.actionResult(app, psRequest{Tool: "drag", App: app, FromX: fromX, FromY: fromY, ToX: toX, ToY: toY, WindowBounds: snapshot.WindowBounds})
+	return s.actionResult(ctx, app, psRequest{Tool: "drag", App: app, FromX: fromX, FromY: fromY, ToX: toX, ToY: toY, WindowBounds: snapshot.WindowBounds})
 }
 
-func (s *service) typeText(app, text string) toolCallResult {
+func (s *service) typeText(ctx context.Context, app, text string) toolCallResult {
 	if app == "" {
 		return textResult("Missing required argument: app", true)
 	}
@@ -396,10 +403,10 @@ func (s *service) typeText(app, text string) toolCallResult {
 	if s.currentSnapshot(app) == nil {
 		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
 	}
-	return s.actionResult(app, psRequest{Tool: "type_text", App: app, Text: text})
+	return s.actionResult(ctx, app, psRequest{Tool: "type_text", App: app, Text: text})
 }
 
-func (s *service) pressKey(app, key string) toolCallResult {
+func (s *service) pressKey(ctx context.Context, app, key string) toolCallResult {
 	if app == "" {
 		return textResult("Missing required argument: app", true)
 	}
@@ -409,10 +416,10 @@ func (s *service) pressKey(app, key string) toolCallResult {
 	if s.currentSnapshot(app) == nil {
 		return textResult("No app state is available for "+app+". Run get_app_state before action tools.", true)
 	}
-	return s.actionResult(app, psRequest{Tool: "press_key", App: app, Key: key})
+	return s.actionResult(ctx, app, psRequest{Tool: "press_key", App: app, Key: key})
 }
 
-func (s *service) setValue(app, elementIndex, value string) toolCallResult {
+func (s *service) setValue(ctx context.Context, app, elementIndex, value string) toolCallResult {
 	if app == "" {
 		return textResult("Missing required argument: app", true)
 	}
@@ -427,11 +434,11 @@ func (s *service) setValue(app, elementIndex, value string) toolCallResult {
 	if err != nil {
 		return textResult(err.Error(), true)
 	}
-	return s.actionResult(app, psRequest{Tool: "set_value", App: app, Element: record, Value: value})
+	return s.actionResult(ctx, app, psRequest{Tool: "set_value", App: app, Element: record, Value: value})
 }
 
-func (s *service) actionResult(app string, request psRequest) toolCallResult {
-	snapshot, result := s.refreshSnapshot(app, request)
+func (s *service) actionResult(ctx context.Context, app string, request psRequest) toolCallResult {
+	snapshot, result := s.refreshSnapshot(ctx, app, request)
 	if result.IsError {
 		return result
 	}
@@ -442,8 +449,8 @@ func (s *service) currentSnapshot(app string) *appSnapshot {
 	return s.snapshots[strings.ToLower(app)]
 }
 
-func (s *service) refreshSnapshot(app string, request psRequest) (*appSnapshot, toolCallResult) {
-	response, err := runPowerShell(request)
+func (s *service) refreshSnapshot(ctx context.Context, app string, request psRequest) (*appSnapshot, toolCallResult) {
+	response, err := s.runPowerShell(ctx, request)
 	if err != nil {
 		return nil, textResult(err.Error(), true)
 	}
@@ -481,51 +488,76 @@ func lookupElement(snapshot *appSnapshot, elementIndex string) (*elementRecord, 
 	return nil, fmt.Errorf("unknown element_index %q", elementIndex)
 }
 
-func runPowerShell(request psRequest) (*psResponse, error) {
+func (s *service) runPowerShell(ctx context.Context, request psRequest) (*psResponse, error) {
 	if runtime.GOOS != "windows" {
 		return nil, errors.New("Windows Computer Use runtime requires powershell.exe on Windows")
 	}
 
-	tempDir, err := os.MkdirTemp("", "open-computer-use-windows-*")
-	if err != nil {
-		return nil, err
-	}
-	defer os.RemoveAll(tempDir)
+	s.psMu.Lock()
+	defer s.psMu.Unlock()
 
-	scriptPath := filepath.Join(tempDir, "runtime.ps1")
-	operationPath := filepath.Join(tempDir, "operation.json")
-	if err := os.WriteFile(scriptPath, []byte(windowsRuntimeScript), 0o600); err != nil {
-		return nil, err
-	}
-	operationData, err := json.Marshal(request)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(operationPath, operationData, 0o600); err != nil {
-		return nil, err
+	if s.psCmd == nil {
+		tempDir, err := os.MkdirTemp("", "open-computer-use-windows-*")
+		if err != nil {
+			return nil, err
+		}
+		scriptPath := filepath.Join(tempDir, "runtime.ps1")
+		if err := os.WriteFile(scriptPath, []byte(windowsRuntimeScript), 0o600); err != nil {
+			return nil, err
+		}
+
+		cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath)
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		in, _ := cmd.StdinPipe()
+		out, _ := cmd.StdoutPipe()
+		cmd.Start()
+		s.psCmd = cmd
+		s.psIn = in
+		s.psOut = bufio.NewReader(out)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	timeout := 30 * time.Second
+	if request.Tool == "wait_for_condition" && request.Pages > 0 {
+		timeout = time.Duration(request.Pages)*time.Second + (10 * time.Second)
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath, operationPath)
-	output, err := cmd.CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
-		return nil, errors.New("Windows runtime timed out after 30s")
-	}
+	reqBytes, err := json.Marshal(request)
 	if err != nil {
-		text := strings.TrimSpace(string(output))
-		if text == "" {
-			text = err.Error()
-		}
-		return nil, fmt.Errorf("Windows runtime failed: %s", text)
+		return nil, err
 	}
+	s.psIn.Write(append(reqBytes, '\n'))
 
-	var response psResponse
-	if err := json.Unmarshal(output, &response); err != nil {
-		return nil, fmt.Errorf("Windows runtime returned invalid JSON: %w: %s", err, strings.TrimSpace(string(output)))
+	type readResult struct {
+		line string
+		err  error
 	}
-	return &response, nil
+	ch := make(chan readResult, 1)
+	go func() {
+		line, err := s.psOut.ReadString('\n')
+		ch <- readResult{line, err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		s.psCmd.Process.Kill()
+		s.psCmd = nil
+		return nil, ctx.Err()
+	case res := <-ch:
+		if res.err != nil {
+			s.psCmd.Process.Kill()
+			s.psCmd = nil
+			return nil, fmt.Errorf("PowerShell daemon failed: %w", res.err)
+		}
+		var response psResponse
+		if err := json.Unmarshal([]byte(res.line), &response); err != nil {
+			s.psCmd.Process.Kill()
+			s.psCmd = nil
+			return nil, fmt.Errorf("Windows runtime returned invalid JSON: %w", err)
+		}
+		return &response, nil
+	}
 }
 
 func requiredString(args map[string]any, key string) string {
@@ -633,10 +665,10 @@ func toolDefinitions() []toolDefinition {
 			Description: "Click on text found on the screen using OCR. Useful for Canvas, Games, or legacy UI where UIA tree fails. This tool is part of plugin `Computer Use`.",
 			Annotations: defaultAnnotations(),
 			InputSchema: objectSchema(map[string]any{
-				"app":           stringProperty("App name or bundle identifier"),
-				"text":          stringProperty("The exact or partial text to search for on the screen"),
-				"click_count":   integerProperty("Number of clicks. Defaults to 1"),
-				"mouse_button":  enumStringProperty("Mouse button to click. Defaults to left.", []string{"left", "right", "middle"}),
+				"app":          stringProperty("App name or bundle identifier"),
+				"text":         stringProperty("The exact or partial text to search for on the screen"),
+				"click_count":  integerProperty("Number of clicks. Defaults to 1"),
+				"mouse_button": enumStringProperty("Mouse button to click. Defaults to left.", []string{"left", "right", "middle"}),
 			}, []string{"app", "text"}),
 		},
 		{
@@ -798,7 +830,7 @@ func runCLI(args []string, stdout io.Writer) error {
 		fmt.Fprintln(stdout, "Windows runtime: UI Automation and Win32 window-message bridge are available when this process runs in the signed-in desktop session.")
 		return nil
 	case "list-apps":
-		result := newService().callTool("list_apps", map[string]any{})
+		result := newService().callTool(context.Background(), "list_apps", map[string]any{})
 		if result.IsError {
 			return errors.New(result.Content[0].Text)
 		}
@@ -808,7 +840,7 @@ func runCLI(args []string, stdout io.Writer) error {
 		if len(args) != 2 {
 			return errors.New("snapshot requires an app name, process name, window title, or pid")
 		}
-		result := newService().callTool("get_app_state", map[string]any{"app": args[1]})
+		result := newService().callTool(context.Background(), "get_app_state", map[string]any{"app": args[1]})
 		if result.IsError {
 			return errors.New(result.Content[0].Text)
 		}
@@ -888,7 +920,7 @@ func runCallCommand(args []string, svc *service) (any, bool, error) {
 		var outputs []map[string]any
 		hasError := false
 		for _, call := range calls {
-			result := svc.callTool(call.Tool, call.Args)
+			result := svc.callTool(context.Background(), call.Tool, call.Args)
 			outputs = append(outputs, map[string]any{"tool": call.Tool, "result": result})
 			if result.IsError {
 				hasError = true
@@ -905,7 +937,7 @@ func runCallCommand(args []string, svc *service) (any, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	result := svc.callTool(toolName, arguments)
+	result := svc.callTool(context.Background(), toolName, arguments)
 	return result, result.IsError, nil
 }
 
@@ -999,7 +1031,7 @@ func runMCP(stdin io.Reader, stdout io.Writer) error {
 			_ = encoder.Encode(jsonRPCError(nil, -32700, "Invalid JSON-RPC payload"))
 			continue
 		}
-		response := handleMCPRequest(request, svc)
+		response := handleMCPRequest(context.Background(), request, svc)
 		if response != nil {
 			if err := encoder.Encode(response); err != nil {
 				return err
@@ -1008,7 +1040,7 @@ func runMCP(stdin io.Reader, stdout io.Writer) error {
 	}
 }
 
-func handleMCPRequest(request map[string]any, svc *service) (res map[string]any) {
+func handleMCPRequest(ctx context.Context, request map[string]any, svc *service) (res map[string]any) {
 	defer func() {
 		if r := recover(); r != nil {
 			res = jsonRPCError(request["id"], -32603, fmt.Sprintf("Internal Error: %v", r))
@@ -1041,7 +1073,7 @@ func handleMCPRequest(request map[string]any, svc *service) (res map[string]any)
 		if arguments == nil {
 			arguments = map[string]any{}
 		}
-		return jsonRPCResult(id, svc.callTool(name, arguments))
+		return jsonRPCResult(id, svc.callTool(ctx, name, arguments))
 	default:
 		if method == "" {
 			return nil

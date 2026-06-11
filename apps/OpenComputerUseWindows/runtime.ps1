@@ -1,7 +1,4 @@
-param(
-    [Parameter(Mandatory = $true)]
-    [string]$OperationPath
-)
+# param removed for daemon mode
 
 $ErrorActionPreference = "Stop"
 
@@ -31,6 +28,10 @@ public static class OCUWin32 {
         public int X;
         public int Y;
     }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool PrintWindow(IntPtr hwnd, IntPtr hDC, uint nFlags);
 
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
@@ -630,14 +631,22 @@ function Render-Tree($element, $windowBounds) {
     }
 }
 
-function Capture-WindowPngBase64($bounds) {
-    if ($null -eq $bounds -or $bounds.width -le 0 -or $bounds.height -le 0) {
-        return $null
-    }
+function Capture-WindowPngBase64($hwnd, $bounds) {
+    if ($null -eq $bounds -or $bounds.width -le 0 -or $bounds.height -le 0) { return $null }
     try {
         $bitmap = New-Object System.Drawing.Bitmap ([int][math]::Round($bounds.width)), ([int][math]::Round($bounds.height))
         $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-        $graphics.CopyFromScreen([int][math]::Round($bounds.x), [int][math]::Round($bounds.y), 0, 0, $bitmap.Size)
+        
+        $hdc = $graphics.GetHdc()
+        # PW_CLIENTONLY | PW_RENDERFULLCONTENT (3) captures fully rendered frame even if occluded
+        $success = [OCUWin32]::PrintWindow($hwnd, $hdc, 3)
+        $graphics.ReleaseHdc($hdc)
+        
+        if (-not $success) {
+            # Fallback to physical screen copy
+            $graphics.CopyFromScreen([int][math]::Round($bounds.x), [int][math]::Round($bounds.y), 0, 0, $bitmap.Size)
+        }
+        
         $stream = New-Object System.IO.MemoryStream
         $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
         $graphics.Dispose()
@@ -645,9 +654,7 @@ function Capture-WindowPngBase64($bounds) {
         $bytes = $stream.ToArray()
         $stream.Dispose()
         return [Convert]::ToBase64String($bytes)
-    } catch {
-        return $null
-    }
+    } catch { return $null }
 }
 
 function Get-FocusedSummary($processId) {
@@ -695,7 +702,7 @@ function Build-Snapshot([string]$query) {
         }
         windowTitle = $process.MainWindowTitle
         windowBounds = $bounds
-        screenshotPngBase64 = Capture-WindowPngBase64 $bounds
+        screenshotPngBase64 = Capture-WindowPngBase64 $process.MainWindowHandle $bounds
         treeLines = @($rendered.lines)
         focusedSummary = Get-FocusedSummary $process.Id
         selectedText = Get-SelectedText $process.Id
@@ -1064,6 +1071,10 @@ function Find-ElementByNameRegex($element, [string]$nameRegex) {
     if ($null -eq $element) { return $false }
     $name = Get-ElementString $element "Name"
     if ($null -ne $name -and $name -match $nameRegex) { return $true }
+    $autoId = Get-ElementString $element "AutomationId"
+    if ($null -ne $autoId -and $autoId -match $nameRegex) { return $true }
+    $className = Get-ElementString $element "ClassName"
+    if ($null -ne $className -and $className -match $nameRegex) { return $true }
     
     $walker = [Windows.Automation.TreeWalker]::ControlViewWalker
     $child = $walker.GetFirstChild($element)
@@ -1160,91 +1171,107 @@ public class OCUEventWaiter {
     }
 }
 
-$operation = Get-Content -Raw -Path $OperationPath | ConvertFrom-Json
+$InputReader = [System.IO.StreamReader]::new([Console]::OpenStandardInput())
+$OutputWriter = [System.IO.StreamWriter]::new([Console]::OpenStandardOutput())
+$OutputWriter.AutoFlush = $true
 
-try {
-    if ($operation.tool -eq "list_apps") {
-        $response = [pscustomobject]@{ ok = $true; text = (List-Apps) }
-    } elseif ($operation.tool -eq "get_app_state") {
-        $response = [pscustomobject]@{ ok = $true; snapshot = (Build-Snapshot $operation.app) }
-    } else {
-        $process = Resolve-App $operation.app
-        $hwnd = [IntPtr]$process.MainWindowHandle
-        $windowBounds = $operation.windowBounds
-        $element = Find-Element $process $operation.element
+while ($true) {
+    $line = $InputReader.ReadLine()
+    if ($null -eq $line -or $line -eq "exit") { break }
+    if ([string]::IsNullOrWhiteSpace($line)) { continue }
 
-        switch ($operation.tool) {
-            "wait_for_condition" {
-                $success = Invoke-WaitForCondition $operation.app $operation.action $operation.text ([int]$operation.pages)
-                if (-not $success) { throw "Timeout waiting for condition '$($operation.action)' with text '$($operation.text)'" }
-            }
-            "click_by_ocr" {
-                Invoke-ClickByOcr $hwnd $operation.text $operation.mouse_button ([int]$operation.click_count)
-            }
-            "click" {
-                $handled = $false
-                if ($null -ne $element -and $operation.mouse_button -ne "right" -and $operation.mouse_button -ne "middle") {
-                    $handled = Invoke-PreferredClick $element
+    try {
+        $operation = $line | ConvertFrom-Json
+    } catch {
+        $response = [pscustomobject]@{ ok = $false; error = "Invalid JSON input" }
+        $OutputWriter.WriteLine(($response | ConvertTo-Json -Depth 50 -Compress))
+        continue
+    }
+
+    try {
+        if ($operation.tool -eq "list_apps") {
+            $response = [pscustomobject]@{ ok = $true; text = (List-Apps) }
+        } elseif ($operation.tool -eq "get_app_state") {
+            $response = [pscustomobject]@{ ok = $true; snapshot = (Build-Snapshot $operation.app) }
+        } else {
+            $process = Resolve-App $operation.app
+            $hwnd = [IntPtr]$process.MainWindowHandle
+            $windowBounds = $operation.windowBounds
+            $element = Find-Element $process $operation.element
+
+            switch ($operation.tool) {
+                "wait_for_condition" {
+                    $success = Invoke-WaitForCondition $operation.app $operation.action $operation.text ([int]$operation.pages)
+                    if (-not $success) { throw "Timeout waiting for condition '$($operation.action)' with text '$($operation.text)'" }
                 }
-                if (-not $handled) {
-                    if ($null -ne $operation.element -and $null -ne $operation.element.frame) {
-                        $point = Get-ScreenPoint $operation.element.frame $windowBounds
-                    } else {
-                        $point = [pscustomobject]@{
-                            x = [int][math]::Round($windowBounds.x + [double]$operation.x)
-                            y = [int][math]::Round($windowBounds.y + [double]$operation.y)
-                        }
+                "click_by_ocr" {
+                    Invoke-ClickByOcr $hwnd $operation.text $operation.mouse_button ([int]$operation.click_count)
+                }
+                "click" {
+                    $handled = $false
+                    if ($null -ne $element -and $operation.mouse_button -ne "right" -and $operation.mouse_button -ne "middle") {
+                        $handled = Invoke-PreferredClick $element
                     }
-                    Send-MouseClick $hwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
+                    if (-not $handled) {
+                        if ($null -ne $operation.element -and $null -ne $operation.element.frame) {
+                            $point = Get-ScreenPoint $operation.element.frame $windowBounds
+                        } else {
+                            $point = [pscustomobject]@{
+                                x = [int][math]::Round($windowBounds.x + [double]$operation.x)
+                                y = [int][math]::Round($windowBounds.y + [double]$operation.y)
+                            }
+                        }
+                        Send-MouseClick $hwnd $point.x $point.y $operation.mouse_button ([int]$operation.click_count)
+                    }
+                }
+                "perform_secondary_action" {
+                    if ($null -eq $element) { throw "unknown element_index '$($operation.element.index)'" }
+                    Invoke-SecondaryAction $element $operation.action
+                }
+                "scroll" {
+                    $handled = $false
+                    if ($null -ne $element) {
+                        $handled = Invoke-Scroll $element $operation.direction ([double]$operation.pages)
+                    }
+                    if (-not $handled) {
+                        $point = Get-ScreenPoint $operation.element.frame $windowBounds
+                        Send-Scroll $hwnd $point.x $point.y $operation.direction ([double]$operation.pages)
+                    }
+                }
+                "drag" {
+                    Send-Drag $hwnd ([int][math]::Round($windowBounds.x + [double]$operation.from_x)) ([int][math]::Round($windowBounds.y + [double]$operation.from_y)) ([int][math]::Round($windowBounds.x + [double]$operation.to_x)) ([int][math]::Round($windowBounds.y + [double]$operation.to_y))
+                }
+                "type_text" {
+                    if (-not (Invoke-TypeText $process $operation.text)) {
+                        Send-Text $hwnd $operation.text
+                    }
+                }
+                "press_key" {
+                    Send-Key $hwnd $operation.key
+                }
+                "set_value" {
+                    if ($null -eq $element) { throw "unknown element_index '$($operation.element.index)'" }
+                    $valuePattern = Get-CurrentPatternOrNull $element ([Windows.Automation.ValuePattern]::Pattern)
+                    if ($null -eq $valuePattern) {
+                        throw "Cannot set a value for an element that is not settable"
+                    }
+                    $valuePattern.SetValue($operation.value)
+                }
+                default {
+                    throw "unsupportedTool(`"$($operation.tool)`")"
                 }
             }
-            "perform_secondary_action" {
-                if ($null -eq $element) { throw "unknown element_index '$($operation.element.index)'" }
-                Invoke-SecondaryAction $element $operation.action
-            }
-            "scroll" {
-                $handled = $false
-                if ($null -ne $element) {
-                    $handled = Invoke-Scroll $element $operation.direction ([double]$operation.pages)
-                }
-                if (-not $handled) {
-                    $point = Get-ScreenPoint $operation.element.frame $windowBounds
-                    Send-Scroll $hwnd $point.x $point.y $operation.direction ([double]$operation.pages)
-                }
-            }
-            "drag" {
-                Send-Drag $hwnd ([int][math]::Round($windowBounds.x + [double]$operation.from_x)) ([int][math]::Round($windowBounds.y + [double]$operation.from_y)) ([int][math]::Round($windowBounds.x + [double]$operation.to_x)) ([int][math]::Round($windowBounds.y + [double]$operation.to_y))
-            }
-            "type_text" {
-                if (-not (Invoke-TypeText $process $operation.text)) {
-                    Send-Text $hwnd $operation.text
-                }
-            }
-            "press_key" {
-                Send-Key $hwnd $operation.key
-            }
-            "set_value" {
-                if ($null -eq $element) { throw "unknown element_index '$($operation.element.index)'" }
-                $valuePattern = Get-CurrentPatternOrNull $element ([Windows.Automation.ValuePattern]::Pattern)
-                if ($null -eq $valuePattern) {
-                    throw "Cannot set a value for an element that is not settable"
-                }
-                $valuePattern.SetValue($operation.value)
-            }
-            default {
-                throw "unsupportedTool(`"$($operation.tool)`")"
-            }
+
+            Start-Sleep -Milliseconds 120
+            $response = [pscustomobject]@{ ok = $true; snapshot = (Build-Snapshot $operation.app) }
         }
+    } catch {
+        $message = $_.Exception.Message
+        if (-not [string]::IsNullOrWhiteSpace($_.ScriptStackTrace)) {
+            $message = "$message at $($_.ScriptStackTrace)"
+        }
+        $response = [pscustomobject]@{ ok = $false; error = $message }
+    }
 
-        Start-Sleep -Milliseconds 120
-        $response = [pscustomobject]@{ ok = $true; snapshot = (Build-Snapshot $operation.app) }
-    }
-} catch {
-    $message = $_.Exception.Message
-    if (-not [string]::IsNullOrWhiteSpace($_.ScriptStackTrace)) {
-        $message = "$message at $($_.ScriptStackTrace)"
-    }
-    $response = [pscustomobject]@{ ok = $false; error = $message }
+    $OutputWriter.WriteLine(($response | ConvertTo-Json -Depth 50 -Compress))
 }
-
-$response | ConvertTo-Json -Depth 50 -Compress
