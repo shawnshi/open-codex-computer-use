@@ -71,7 +71,7 @@ Copy-Item -Path "open-computer-use.exe" -Destination "$env:APPDATA\npm\node_modu
 ```
 
 ### 4. 注册到 Antigravity CLI
-修改位于 `C:\Users\shich\.gemini\config\mcp_config.json` 的配置文件，加入以下挂载节点：
+修改位于 `..\.gemini\config\mcp_config.json` 的配置文件，加入以下挂载节点：
 ```json
 {
   "mcpServers": {

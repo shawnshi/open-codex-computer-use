@@ -936,7 +936,13 @@ func runMCP(stdin io.Reader, stdout io.Writer) error {
 	}
 }
 
-func handleMCPRequest(request map[string]any, svc *service) map[string]any {
+func handleMCPRequest(request map[string]any, svc *service) (res map[string]any) {
+	defer func() {
+		if r := recover(); r != nil {
+			res = jsonRPCError(request["id"], -32603, fmt.Sprintf("Internal Error: %v", r))
+		}
+	}()
+
 	id := request["id"]
 	method, _ := request["method"].(string)
 	params, _ := request["params"].(map[string]any)

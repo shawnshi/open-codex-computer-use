@@ -247,7 +247,9 @@ function Get-VirtualKey([string]$key) {
         "volume_mute" = 0xAD; "volume_down" = 0xAE; "volume_up" = 0xAF
         "media_next" = 0xB0; "media_prev" = 0xB1; "media_stop" = 0xB2; "media_play_pause" = 0xB3
         "print" = 0x2A; "print_screen" = 0x2C; "insert" = 0x2D; "menu" = 0x5D; "apps" = 0x5D
-        "-" = 0xBD; "=" = 0xBB; "[" = 0xDB; "]" = 0xDD; "\" = 0xDC; ";" = 0xBA; "'" = 0xDE; "," = 0xBC; "." = 0xBE; "/" = 0xBF; "`" = 0xC0
+        "win" = 0x5B; "lwin" = 0x5B; "rwin" = 0x5C; "super" = 0x5B; "cmd" = 0x5B
+        "shift" = 0x10; "ctrl" = 0x11; "control" = 0x11; "alt" = 0x12
+        '-' = 0xBD; '=' = 0xBB; '[' = 0xDB; ']' = 0xDD; '\' = 0xDC; ';' = 0xBA; "'" = 0xDE; ',' = 0xBC; '.' = 0xBE; '/' = 0xBF; '`' = 0xC0
     }
     if ($map.ContainsKey($normalized)) {
         return $map[$normalized]
@@ -297,10 +299,42 @@ function Send-Key([IntPtr]$hwnd, [string]$key) {
 
 function Resolve-App([string]$query) {
     $normalized = $query.Trim()
+
+    if ($normalized -ieq "desktop" -or $normalized -ieq "screen") {
+        return [pscustomobject]@{
+            ProcessName = "Desktop"
+            Id = 0
+            MainWindowTitle = "Desktop"
+            MainWindowHandle = [IntPtr]::Zero
+        }
+    }
+
     $processQuery = $normalized
     if ($processQuery.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)) {
         $processQuery = $processQuery.Substring(0, $processQuery.Length - 4)
     }
+
+    # 1. First, search through UI Automation Top-Level windows (pierces UWP/ApplicationFrameHost)
+    $condition = [Windows.Automation.Condition]::TrueCondition
+    try {
+        $children = [Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Children, $condition)
+        for ($i = 0; $i -lt $children.Count; $i++) {
+            $node = $children.Item($i)
+            $name = ""
+            try { $name = $node.Current.Name } catch {}
+            if (-not [string]::IsNullOrWhiteSpace($name) -and ($name -ieq $normalized -or $name -ilike "*$normalized*")) {
+                $pidValue = $node.Current.ProcessId
+                $p = Get-Process -Id $pidValue -ErrorAction SilentlyContinue
+                if ($null -ne $p) {
+                    return $p
+                }
+            }
+        }
+    } catch {
+        # Fallback if UIA fails
+    }
+
+    # 2. Fallback to standard process search
     $processes = @(Get-Process | Where-Object { $_.MainWindowHandle -ne 0 })
     $pidValue = 0
     if ([int]::TryParse($normalized, [ref]$pidValue)) {
@@ -338,7 +372,10 @@ function Resolve-App([string]$query) {
 }
 
 function Get-MainElement($process) {
-    if ($process.MainWindowHandle -ne 0) {
+    if ($process.ProcessName -ieq "Desktop") {
+        return [Windows.Automation.AutomationElement]::RootElement
+    }
+    if ($process.MainWindowHandle -ne 0 -and $process.MainWindowHandle -ne [IntPtr]::Zero) {
         return [Windows.Automation.AutomationElement]::FromHandle([IntPtr]$process.MainWindowHandle)
     }
     $condition = New-Object Windows.Automation.PropertyCondition ([Windows.Automation.AutomationElement]::ProcessIdProperty), $process.Id
