@@ -112,7 +112,7 @@ function Get-WindowRectFrame([IntPtr]$hwnd) {
 
 function Get-ElementFrame($element, $windowBounds) {
     try {
-        $rect = $element.Current.BoundingRectangle
+        try { $rect = $element.Cached.BoundingRectangle } catch { $rect = $element.Current.BoundingRectangle }
         if ($rect.IsEmpty -or $rect.Width -le 0 -or $rect.Height -le 0) {
             return $null
         }
@@ -206,6 +206,29 @@ function Send-Scroll([IntPtr]$hwnd, [int]$screenX, [int]$screenY, [string]$direc
 }
 
 function Send-Text([IntPtr]$hwnd, [string]$text) {
+    if ($text.Length -gt 10) {
+        try {
+            $backup = Get-Clipboard -Raw -ErrorAction Ignore
+            Set-Clipboard -Value $text -ErrorAction Stop
+            
+            # Send Ctrl+V
+            [void][OCUWin32]::PostMessage($hwnd, $WM_KEYDOWN, [IntPtr]0x11, [IntPtr]::Zero) # Ctrl
+            [void][OCUWin32]::PostMessage($hwnd, $WM_KEYDOWN, [IntPtr]0x56, [IntPtr]::Zero) # V
+            Start-Sleep -Milliseconds 25
+            [void][OCUWin32]::PostMessage($hwnd, $WM_KEYUP, [IntPtr]0x56, [IntPtr]::Zero)   # V
+            [void][OCUWin32]::PostMessage($hwnd, $WM_KEYUP, [IntPtr]0x11, [IntPtr]::Zero)   # Ctrl
+            
+            Start-Sleep -Milliseconds 50
+            
+            if ($null -ne $backup -and $backup -ne "") {
+                Set-Clipboard -Value $backup -ErrorAction Ignore
+            }
+            return
+        } catch {
+            # Fallback to character loop if clipboard fails
+        }
+    }
+
     foreach ($char in $text.ToCharArray()) {
         [void][OCUWin32]::PostMessage($hwnd, $WM_CHAR, [IntPtr][int][char]$char, [IntPtr]::Zero)
         Start-Sleep -Milliseconds 8
@@ -433,6 +456,10 @@ function Get-PatternNames($element) {
 
 function Get-ElementString($element, [string]$propertyName) {
     try {
+        $value = $element.Cached.$propertyName
+        if ($null -ne $value) { return [string]$value }
+    } catch {}
+    try {
         $value = $element.Current.$propertyName
         if ($null -eq $value) {
             return ""
@@ -445,6 +472,9 @@ function Get-ElementString($element, [string]$propertyName) {
 
 function Get-ElementInt64($element, [string]$propertyName) {
     try {
+        return [int64]$element.Cached.$propertyName
+    } catch {}
+    try {
         return [int64]$element.Current.$propertyName
     } catch {
         return 0
@@ -453,7 +483,7 @@ function Get-ElementInt64($element, [string]$propertyName) {
 
 function Get-ElementControlTypeName($element) {
     try {
-        $controlType = $element.Current.ControlType
+        try { $controlType = $element.Cached.ControlType } catch { $controlType = $element.Current.ControlType }
         if ($null -eq $controlType) {
             return ""
         }
@@ -531,7 +561,7 @@ function Render-Tree($element, $windowBounds) {
         
         # [Antigravity Pruning]: Skip off-screen or zero-bound elements to prevent Token Bloat
         $isOffscreen = $false
-        try { $isOffscreen = $node.Current.IsOffscreen } catch {}
+        try { try { $isOffscreen = $node.Cached.IsOffscreen } catch { $isOffscreen = $node.Current.IsOffscreen } } catch {}
         if ($isOffscreen -and $depth -gt 2) {
             return
         }
@@ -575,7 +605,24 @@ function Render-Tree($element, $windowBounds) {
     $script:visited = $visited
     $script:nextIndex = $nextIndex
     $script:windowBounds = $windowBounds
-    Visit $element 0
+
+    $cacheReq = New-Object Windows.Automation.CacheRequest
+    $cacheReq.Add([Windows.Automation.AutomationElement]::NameProperty)
+    $cacheReq.Add([Windows.Automation.AutomationElement]::BoundingRectangleProperty)
+    $cacheReq.Add([Windows.Automation.AutomationElement]::ControlTypeProperty)
+    $cacheReq.Add([Windows.Automation.AutomationElement]::LocalizedControlTypeProperty)
+    $cacheReq.Add([Windows.Automation.AutomationElement]::ClassNameProperty)
+    $cacheReq.Add([Windows.Automation.AutomationElement]::AutomationIdProperty)
+    $cacheReq.Add([Windows.Automation.AutomationElement]::NativeWindowHandleProperty)
+    $cacheReq.Add([Windows.Automation.AutomationElement]::IsOffscreenProperty)
+    $cacheReq.TreeScope = [Windows.Automation.TreeScope]::Children
+    
+    $cookie = $cacheReq.Activate()
+    try {
+        Visit $element 0
+    } finally {
+        if ($null -ne $cookie) { $cookie.Dispose() }
+    }
 
     [pscustomobject]@{
         records = $records.ToArray()
